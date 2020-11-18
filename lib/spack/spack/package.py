@@ -53,8 +53,7 @@ from six import StringIO
 from six import string_types
 from six import with_metaclass
 from spack.filesystem_view import YamlFilesystemView
-from spack.installer import \
-    install_args_docstring, PackageInstaller, InstallError
+from spack.installer import PackageInstaller, InstallError
 from spack.stage import stage_prefix, Stage, ResourceStage, StageComposite
 from spack.util.package_hash import package_hash
 from spack.version import Version
@@ -307,6 +306,10 @@ class PackageMeta(
         _flush_callbacks('run_before')
         _flush_callbacks('run_after')
 
+        # Reset names for packages that inherit from another
+        # package with a different name
+        attr_dict['_name'] = None
+
         return super(PackageMeta, cls).__new__(cls, name, bases, attr_dict)
 
     @staticmethod
@@ -356,7 +359,7 @@ class PackageMeta(
         The name of a package is the name of its Python module, without
         the containing module names.
         """
-        if not hasattr(self, '_name'):
+        if self._name is None:
             self._name = self.module.__name__
             if '.' in self._name:
                 self._name = self._name[self._name.rindex('.') + 1:]
@@ -679,7 +682,7 @@ class PackageBase(with_metaclass(PackageMeta, PackageViewMixin, object)):
     @classmethod
     def possible_dependencies(
             cls, transitive=True, expand_virtuals=True, deptype='all',
-            visited=None, missing=None):
+            visited=None, missing=None, virtuals=None):
         """Return dict of possible dependencies of this package.
 
         Args:
@@ -692,6 +695,7 @@ class PackageBase(with_metaclass(PackageMeta, PackageViewMixin, object)):
                 far, mapped to their immediate dependencies' names.
             missing (dict, optional): dict to populate with packages and their
                 *missing* dependencies.
+            virtuals (set): if provided, populate with virtuals seen so far.
 
         Returns:
             (dict): dictionary mapping dependency names to *their*
@@ -728,6 +732,8 @@ class PackageBase(with_metaclass(PackageMeta, PackageViewMixin, object)):
 
             # expand virtuals if enabled, otherwise just stop at virtuals
             if spack.repo.path.is_virtual(name):
+                if virtuals is not None:
+                    virtuals.add(name)
                 if expand_virtuals:
                     providers = spack.repo.path.providers_for(name)
                     dep_names = [spec.name for spec in providers]
@@ -760,7 +766,27 @@ class PackageBase(with_metaclass(PackageMeta, PackageViewMixin, object)):
                     continue
 
                 dep_cls.possible_dependencies(
-                    transitive, expand_virtuals, deptype, visited, missing)
+                    transitive, expand_virtuals, deptype, visited, missing,
+                    virtuals)
+
+        return visited
+
+    def enum_constraints(self, visited=None):
+        """Return transitive dependency constraints on this package."""
+        if visited is None:
+            visited = set()
+        visited.add(self.name)
+
+        names = []
+        clauses = []
+
+        for name in self.dependencies:
+            if name not in visited and not spack.spec.Spec(name).virtual:
+                pkg = spack.repo.get(name)
+                dvis, dnames, dclauses = pkg.enum_constraints(visited)
+                visited |= dvis
+                names.extend(dnames)
+                clauses.extend(dclauses)
 
         return visited
 
@@ -1591,17 +1617,45 @@ class PackageBase(with_metaclass(PackageMeta, PackageViewMixin, object)):
         Package implementations should override install() to describe
         their build process.
 
-        Args:"""
+        Args:
+            cache_only (bool): Fail if binary package unavailable.
+            dirty (bool): Don't clean the build environment before installing.
+            explicit (bool): True if package was explicitly installed, False
+                if package was implicitly installed (as a dependency).
+            fail_fast (bool): Fail if any dependency fails to install;
+                otherwise, the default is to install as many dependencies as
+                possible (i.e., best effort installation).
+            fake (bool): Don't really build; install fake stub files instead.
+            force (bool): Install again, even if already installed.
+            install_deps (bool): Install dependencies before installing this
+                package
+            install_source (bool): By default, source is not installed, but
+                for debugging it might be useful to keep it around.
+            keep_prefix (bool): Keep install prefix on failure. By default,
+                destroys it.
+            keep_stage (bool): By default, stage is destroyed only if there
+                are no exceptions during build. Set to True to keep the stage
+                even with exceptions.
+            restage (bool): Force spack to restage the package source.
+            skip_patch (bool): Skip patch stage of build if True.
+            stop_before (InstallPhase): stop execution before this
+                installation phase (or None)
+            stop_at (InstallPhase): last installation phase to be executed
+                (or None)
+            tests (bool or list or set): False to run no tests, True to test
+                all packages, or a list of package names to run tests for some
+            use_cache (bool): Install from binary package, if available.
+            verbose (bool): Display verbose build output (by default,
+                suppresses it)
+        """
         # Non-transitive dev specs need to keep the dev stage and be built from
         # source every time. Transitive ones just need to be built from source.
         dev_path_var = self.spec.variants.get('dev_path', None)
         if dev_path_var:
             kwargs['keep_stage'] = True
 
-        builder = PackageInstaller(self)
-        builder.install(**kwargs)
-
-    do_install.__doc__ += install_args_docstring
+        builder = PackageInstaller([(self, kwargs)])
+        builder.install()
 
     def unit_test_check(self):
         """Hook for unit tests to assert things about package internals.
