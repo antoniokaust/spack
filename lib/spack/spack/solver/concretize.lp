@@ -21,7 +21,15 @@ version_weight(Package, Weight)
 version_weight(Package, Weight)
   :- version(Package, Version), preferred_version_declared(Package, Version, Weight).
 
+% version_satisfies implies that exactly one of the satisfying versions
+% is the package's version, and vice versa.
+1 { version(Package, Version) : version_satisfies(Package, Constraint, Version) } 1
+  :- version_satisfies(Package, Constraint).
+version_satisfies(Package, Constraint)
+  :- version(Package, Version), version_satisfies(Package, Constraint, Version).
+
 #defined preferred_version_declared/3.
+#defined version_satisfies/3.
 
 %-----------------------------------------------------------------------------
 % Dependency semantics
@@ -32,8 +40,7 @@ depends_on(Package, Dependency) :- depends_on(Package, Dependency, _).
 % declared dependencies are real if they're not virtual AND
 % the package is not an external
 depends_on(Package, Dependency, Type)
- :- declared_dependency(Package, Dependency, Type),
-    node(Package),
+ :- dependency_conditions(Package, Dependency, Type),
     not virtual(Dependency),
     not external(Package).
 
@@ -43,10 +50,133 @@ depends_on(Package, Dependency, Type)
   depends_on(Package, Provider, Type)
   : provides_virtual(Provider, Virtual)
 } 1
- :- declared_dependency(Package, Virtual, Type),
+ :- dependency_conditions(Package, Virtual, Type),
     virtual(Virtual),
-    not external(Package),
-    node(Package).
+    not external(Package).
+
+% if any individual condition below is true, trigger the dependency.
+dependency_conditions(P, D, T) :-
+  dependency_conditions_hold(P, D, I),
+  dependency_type(I, T).
+
+#defined dependency_type/2.
+
+% collect all the dependency conditions into a single conditional rule
+% distinguishing between Parent and Package is needed to account for
+% conditions like:
+%
+% depends_on('patchelf@0.9', when='@1.0:1.1 ^python@:2')
+%
+% that include dependencies
+dependency_conditions_hold(Parent, Dependency, ID) :-
+  node(Package)
+    : required_dependency_condition(ID, "node", Package);
+  version(Package, Version)
+    : required_dependency_condition(ID, "version", Package, Version);
+  version_satisfies(Package, Constraint)
+    : required_dependency_condition(ID, "version_satisfies", Package, Constraint);
+  node_platform(Package, Platform)
+    : required_dependency_condition(ID, "node_platform", Package, Platform);
+  node_os(Package, OS)
+    : required_dependency_condition(ID, "node_os", Package, OS);
+  node_target(Package, Target)
+    : required_dependency_condition(ID, "node_target", Package, Target);
+  variant_value(Package, Variant, Value)
+    : required_dependency_condition(ID, "variant_value", Package, Variant, Value);
+  node_compiler(Package, Compiler)
+    : required_dependency_condition(ID, "node_compiler", Package, Compiler);
+  node_compiler_version(Package, Compiler, Version)
+    : required_dependency_condition(ID, "node_compiler_version", Package, Compiler, Version);
+  node_compiler_version_satisfies(Package, Compiler, Version)
+    : required_dependency_condition(ID, "node_compiler_version_satisfies", Package, Compiler, Version);
+  node_flag(Package, FlagType, Flag)
+    : required_dependency_condition(ID, "node_flag", Package, FlagType, Flag);
+  dependency_condition(Parent, Dependency, ID);
+  node(Parent).
+
+#defined dependency_condition/3.
+#defined required_dependency_condition/3.
+#defined required_dependency_condition/4.
+#defined required_dependency_condition/5.
+#defined required_dependency_condition/5.
+
+% general rules for conflicts
+:- node(Package) : conflict_condition(ID, "node", Package);
+   not external(Package) : conflict_condition(ID, "node", Package);
+   version(Package, Version) : conflict_condition(ID, "version", Package, Version);
+   version_satisfies(Package, Constraint) : conflict_condition(ID, "version_satisfies", Package, Constraint);
+   node_platform(Package, Platform) : conflict_condition(ID, "node_platform", Package, Platform);
+   node_os(Package, OS) : conflict_condition(ID, "node_os", Package, OS);
+   node_target(Package, Target) : conflict_condition(ID, "node_target", Package, Target);
+   variant_value(Package, Variant, Value) : conflict_condition(ID, "variant_value", Package, Variant, Value);
+   node_compiler(Package, Compiler) : conflict_condition(ID, "node_compiler", Package, Compiler);
+   node_compiler_version(Package, Compiler, Version) : conflict_condition(ID, "node_compiler_version", Package, Compiler, Version);
+   node_compiler_version_satisfies(Package, Compiler, Version) : conflict_condition(ID, "node_compiler_version_satisfies", Package, Compiler, Version);
+   node_flag(Package, FlagType, Flag) : conflict_condition(ID, "node_flag", Package, FlagType, Flag);
+   conflict(ID, Package).
+
+#defined conflict/2.
+#defined conflict_condition/3.
+#defined conflict_condition/4.
+#defined conflict_condition/5.
+
+% Implications from matching a dependency condition
+node(Dependency) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency).
+
+version(Dependency, Version) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency),
+  imposed_dependency_condition(ID, "version", Dependency, Version).
+
+version_satisfies(Dependency, Constraint) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency),
+  imposed_dependency_condition(ID, "version_satisfies", Dependency, Constraint).
+
+node_platform(Dependency, Platform) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency),
+  imposed_dependency_condition(ID, "node_platform", Dependency, Platform).
+
+node_os(Dependency, OS) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency),
+  imposed_dependency_condition(ID, "node_os", Dependency, OS).
+
+node_target(Dependency, Target) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency),
+  imposed_dependency_condition(ID, "node_target", Dependency, Target).
+
+variant_set(Dependency, Variant, Value) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency),
+  imposed_dependency_condition(ID, "variant_set", Dependency, Variant, Value).
+
+node_compiler(Dependency, Compiler) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency),
+  imposed_dependency_condition(ID, "node_compiler", Dependency, Compiler).
+
+node_compiler_version(Dependency, Compiler, Version) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency),
+  imposed_dependency_condition(ID, "node_compiler_version", Dependency, Compiler, Version).
+
+node_compiler_version_satisfies(Dependency, Compiler, Version) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency),
+  imposed_dependency_condition(ID, "node_compiler_version_satisfies", Dependency, Compiler, Version).
+
+node_flag(Dependency, FlagType, Flag) :-
+  dependency_conditions_hold(Package, Dependency, ID),
+  depends_on(Package, Dependency),
+  imposed_dependency_condition(ID, "node_flag", Dependency, FlagType, Flag).
+
+#defined imposed_dependency_condition/4.
+#defined imposed_dependency_condition/5.
 
 % if a virtual was required by some root spec, one provider is in the DAG
 1 { node(Package) : provides_virtual(Package, Virtual) } 1
@@ -131,6 +261,8 @@ path(Parent, Descendant) :- path(Parent, A), depends_on(A, Descendant).
 #defined external_only/1.
 #defined pkg_provider_preference/4.
 #defined default_provider_preference/3.
+#defined version_satisfies/2.
+#defined node_compiler_version_satisfies/3.
 #defined root/1.
 
 %-----------------------------------------------------------------------------
@@ -230,7 +362,7 @@ variant_default_value(Package, Variant, Value)
 % when assigned a value.
 auto_variant("dev_path").
 auto_variant("patches").
-variant(Package, "dev_path")
+variant(Package, Variant)
   :- variant_set(Package, Variant, _), auto_variant(Variant).
 variant_single_value(Package, "dev_path")
   :- variant_set(Package, "dev_path", _).
@@ -249,9 +381,9 @@ variant_single_value(Package, "dev_path")
 %-----------------------------------------------------------------------------
 % Platform semantics
 %-----------------------------------------------------------------------------
+
 % one platform per node
-1 { node_platform(Package, Platform) : node_platform(Packagee, Platform) } 1
-  :- node(Package).
+:- M = #count { Platform : node_platform(Package, Platform) }, M !=1, node(Package).
 
 % if no platform is set, fall back to the default
 node_platform(Package, Platform)
@@ -299,6 +431,13 @@ node_os(Package, OS)
 % one target per node -- optimization will pick the "best" one
 1 { node_target(Package, Target) : target(Target) } 1 :- node(Package).
 
+% node_target_satisfies semantics
+1 { node_target(Package, Target) : node_target_satisfies(Package, Constraint, Target) } 1
+  :- node_target_satisfies(Package, Constraint).
+node_target_satisfies(Package, Constraint)
+  :- node_target(Package, Target), node_target_satisfies(Package, Constraint, Target).
+#defined node_target_satisfies/3.
+
 % The target weight is either the default target weight
 % or a more specific per-package weight if set
 target_weight(Target, Package, Weight)
@@ -334,16 +473,21 @@ node_target_weight(Package, Weight)
     target_weight(Target, Package, Weight).
 
 % compatibility rules for targets among nodes
-node_target_match_pref(Package, Target) :- node_target_set(Package, Target).
 node_target_match_pref(Dependency, Target)
-  :- depends_on(Package, Dependency), node_target_match_pref(Package, Target),
+  :- depends_on(Package, Dependency),
+     node_target_match_pref(Package, Target),
+     not node_target_set(Dependency, _).
+
+node_target_match_pref(Dependency, Target)
+  :- depends_on(Package, Dependency),
+     node_target_set(Package, Target),
+     not node_target_match_pref(Package, Target),
      not node_target_set(Dependency, _).
 
 node_target_match_pref(Dependency, Target)
   :- depends_on(Package, Dependency),
      root(Package), node_target(Package, Target),
-     not node_target_match_pref(Package, _),
-     not node_target_set(Dependency, _).
+     not node_target_match_pref(Package, _).
 
 node_target_match(Package, 1)
   :- node_target(Package, Target), node_target_match_pref(Package, Target).
@@ -358,13 +502,32 @@ derive_target_from_parent(Parent, Package)
 %-----------------------------------------------------------------------------
 % Compiler semantics
 %-----------------------------------------------------------------------------
+compiler(Compiler) :- compiler_version(Compiler, _).
 
-% one compiler per node
-1 { node_compiler(Package, Compiler) : compiler(Compiler) } 1 :- node(Package).
+% There must be only one compiler set per node. The compiler
+% is chosen among available versions.
 1 { node_compiler_version(Package, Compiler, Version)
     : compiler_version(Compiler, Version) } 1 :- node(Package).
-1 { compiler_weight(Package, Weight) : compiler_weight(Package, Weight) } 1
- :- node(Package).
+
+% Sometimes we just need to know the compiler and not the version
+node_compiler(Package, Compiler) :- node_compiler_version(Package, Compiler, _).
+
+% We can't have a compiler be enforced and select the version from another compiler
+:- node_compiler(Package, Compiler1),
+   node_compiler_version(Package, Compiler2, _),
+   Compiler1 != Compiler2.
+
+% define node_compiler_version_satisfies/3 from node_compiler_version_satisfies/4
+% version_satisfies implies that exactly one of the satisfying versions
+% is the package's version, and vice versa.
+1 { node_compiler_version(Package, Compiler, Version)
+    : node_compiler_version_satisfies(Package, Compiler, Constraint, Version) } 1
+  :- node_compiler_version_satisfies(Package, Compiler, Constraint).
+node_compiler_version_satisfies(Package, Compiler, Constraint)
+  :- node_compiler_version(Package, Compiler, Version),
+     node_compiler_version_satisfies(Package, Compiler, Constraint, Version).
+
+#defined node_compiler_version_satisfies/4.
 
 % If the compiler version was set from the command line,
 % respect it verbatim
@@ -411,17 +574,14 @@ compiler_version_match(Package, 1)
 
 % compilers weighted by preference according to packages.yaml
 compiler_weight(Package, Weight)
- :- node_compiler(Package, Compiler),
-    node_compiler_version(Package, Compiler, V),
+ :- node_compiler_version(Package, Compiler, V),
     node_compiler_preference(Package, Compiler, V, Weight).
 compiler_weight(Package, Weight)
- :- node_compiler(Package, Compiler),
-    node_compiler_version(Package, Compiler, V),
+ :- node_compiler_version(Package, Compiler, V),
     not node_compiler_preference(Package, Compiler, V, _),
     default_compiler_preference(Compiler, V, Weight).
 compiler_weight(Package, 100)
- :- node_compiler(Package, Compiler),
-    node_compiler_version(Package, Compiler, Version),
+ :- node_compiler_version(Package, Compiler, Version),
     not node_compiler_preference(Package, Compiler, Version, _),
     not default_compiler_preference(Compiler, Version, _).
 
@@ -455,7 +615,6 @@ node_flag_source(Dependency, Q)
 node_flag(Package, FlagType, Flag)
  :- not node_flag_set(Package),
     compiler_version_flag(Compiler, Version, FlagType, Flag),
-    node_compiler(Package, Compiler),
     node_compiler_version(Package, Compiler, Version),
     flag_type(FlagType),
     compiler(Compiler),
@@ -464,7 +623,6 @@ node_flag(Package, FlagType, Flag)
 node_flag_compiler_default(Package)
  :- not node_flag_set(Package),
     compiler_version_flag(Compiler, Version, FlagType, Flag),
-    node_compiler(Package, Compiler),
     node_compiler_version(Package, Compiler, Version),
     flag_type(FlagType),
     compiler(Compiler),

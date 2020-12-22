@@ -356,69 +356,6 @@ class PyclingoDriver(object):
             [atoms[s] for s in body_symbols] + rule_atoms
         )
 
-    def integrity_constraint(self, clauses, default_negated=None):
-        """Add an integrity constraint to the solver.
-
-        Args:
-            clauses: clauses to be added to the integrity constraint
-            default_negated: clauses to be added to the integrity
-                constraint after with a default negation
-        """
-        symbols, negated_symbols, atoms = _normalize(clauses), [], {}
-        if default_negated:
-            negated_symbols = _normalize(default_negated)
-
-        for s in symbols + negated_symbols:
-            atoms[s] = self.backend.add_atom(s)
-
-        symbols_str = ",".join(str(a) for a in symbols)
-        if negated_symbols:
-            negated_symbols_str = ",".join(
-                "not " + str(a) for a in negated_symbols
-            )
-            symbols_str += ",{0}".format(negated_symbols_str)
-        rule_str = ":- {0}.".format(symbols_str)
-        rule_atoms = self._register_rule_for_cores(rule_str)
-
-        # print rule before adding
-        self.out.write("{0}\n".format(rule_str))
-        self.backend.add_rule(
-            [],
-            [atoms[s] for s in symbols] +
-            [-atoms[s] for s in negated_symbols]
-            + rule_atoms
-        )
-
-    def iff(self, expr1, expr2):
-        self.rule(head=expr1, body=expr2)
-        self.rule(head=expr2, body=expr1)
-
-    def one_of_iff(self, head, versions):
-        # if there are no versions, skip this one_of_iff
-        if not versions:
-            return
-
-        self.out.write("%s :- %s.\n" % (head, AspOneOf(*versions)))
-        self.out.write("%s :- %s.\n" % (AspOneOf(*versions), head))
-
-        at_least_1_sym = fn.at_least_1(*head.args).symbol()
-        at_least_1 = self.backend.add_atom(at_least_1_sym)
-
-        more_than_1_sym = fn.more_than_1(*head.args).symbol()
-        more_than_1 = self.backend.add_atom(more_than_1_sym)
-
-        version_atoms = [self.backend.add_atom(f.symbol()) for f in versions]
-        self.backend.add_weight_rule(
-            [at_least_1], 1, [(v, 1) for v in version_atoms])
-        self.backend.add_weight_rule(
-            [more_than_1], 2, [(v, 1) for v in version_atoms])
-
-        head_atom = self.backend.add_atom(head.symbol())
-        self.backend.add_rule([head_atom], [at_least_1, -more_than_1])
-
-        self.backend.add_rule([], [head_atom, more_than_1])
-        self.backend.add_rule([], [head_atom, -at_least_1])
-
     def solve(
             self, solver_setup, specs, dump=None, nmodels=0,
             timers=False, stats=False, tests=False
@@ -526,6 +463,10 @@ class SpackSolverSetup(object):
 
         # id for dummy variables
         self.card = 0
+        self._condition_id_counter = 0
+
+        # Caches to optimize the setup phase of the solver
+        self.target_specs_cache = None
 
     def pkg_version_rules(self, pkg):
         """Output declared versions of a package.
@@ -614,11 +555,16 @@ class SpackSolverSetup(object):
                 # TODO: of a rule and filter unwanted functions.
                 to_be_filtered = ['node_compiler_hard']
                 clauses = [x for x in clauses if x.name not in to_be_filtered]
-                external = fn.external(pkg.name)
 
-                self.gen.integrity_constraint(
-                    AspAnd(*clauses), AspAnd(external)
-                )
+                # Emit facts based on clauses
+                cond_id = self._condition_id_counter
+                self._condition_id_counter += 1
+                self.gen.fact(fn.conflict(cond_id, pkg.name))
+                for clause in clauses:
+                    self.gen.fact(fn.conflict_condition(
+                        cond_id, clause.name, *clause.args
+                    ))
+                self.gen.newline()
 
     def available_compilers(self):
         """Facts about available compilers."""
@@ -631,7 +577,6 @@ class SpackSolverSetup(object):
             compiler_versions[compiler.name].add(compiler.version)
 
         for compiler in sorted(compiler_versions):
-            self.gen.fact(fn.compiler(compiler))
             for v in sorted(compiler_versions[compiler]):
                 self.gen.fact(fn.compiler_version(compiler, v))
 
@@ -755,10 +700,17 @@ class SpackSolverSetup(object):
 
     def package_dependencies_rules(self, pkg, tests):
         """Translate 'depends_on' directives into ASP logic."""
-        for name, conditions in sorted(pkg.dependencies.items()):
+        for _, conditions in sorted(pkg.dependencies.items()):
             for cond, dep in sorted(conditions.items()):
+                global_condition_id = self._condition_id_counter
+                self._condition_id_counter += 1
                 named_cond = cond.copy()
                 named_cond.name = named_cond.name or pkg.name
+
+                # each independent condition has an id
+                self.gen.fact(fn.dependency_condition(
+                    dep.pkg.name, dep.spec.name, global_condition_id
+                ))
 
                 for t in sorted(dep.type):
                     # Skip test dependencies if they're not requested at all
@@ -770,22 +722,21 @@ class SpackSolverSetup(object):
                                         and pkg.name not in tests):
                         continue
 
-                    if cond == spack.spec.Spec():
-                        self.gen.fact(
-                            fn.declared_dependency(
-                                dep.pkg.name, dep.spec.name, t
-                            )
-                        )
-                    else:
-                        clauses = self.spec_traverse_clauses(named_cond)
+                    # there is a declared dependency of type t
+                    self.gen.fact(fn.dependency_type(global_condition_id, t))
 
-                        self.gen.rule(
-                            fn.declared_dependency(
-                                dep.pkg.name, dep.spec.name, t
-                            ), self.gen._and(*clauses)
-                        )
+                # if it has conditions, declare them.
+                conditions = self.spec_clauses(named_cond, body=True)
+                for cond in conditions:
+                    self.gen.fact(fn.required_dependency_condition(
+                        global_condition_id, cond.name, *cond.args
+                    ))
 
                 # add constraints on the dependency from dep spec.
+
+                # TODO: nest this in the type loop so that dependency
+                # TODO: constraints apply only for their deptypes and
+                # TODO: specific conditions.
                 if spack.repo.path.is_virtual(dep.spec.name):
                     self.virtual_constraints.add(str(dep.spec))
                     conditions = ([fn.real_node(pkg.name)] +
@@ -799,20 +750,11 @@ class SpackSolverSetup(object):
                 else:
                     clauses = self.spec_clauses(dep.spec)
                     for clause in clauses:
-                        self.gen.rule(
-                            clause,
-                            self.gen._and(
-                                fn.depends_on(dep.pkg.name, dep.spec.name),
-                                *self.spec_traverse_clauses(named_cond)
-                            )
-                        )
-            self.gen.newline()
+                        self.gen.fact(fn.imposed_dependency_condition(
+                            global_condition_id, clause.name, *clause.args
+                        ))
 
-    def spec_traverse_clauses(self, named_cond):
-        clauses = []
-        for d in named_cond.traverse():
-            clauses.extend(self.spec_clauses(d, body=True))
-        return clauses
+                self.gen.newline()
 
     def virtual_preferences(self, pkg_name, func):
         """Call func(vspec, provider, i) for each of pkg's provider prefs."""
@@ -894,6 +836,9 @@ class SpackSolverSetup(object):
                     self.gen.rule(clause, spec_id.symbol())
                 spec_id_list.append(spec_id)
 
+            # TODO: find another way to do everything below, without
+            # TODO: generating ground rules.
+
             # If one of the external specs is selected then the package
             # is external and viceversa
             # TODO: make it possible to declare the rule like below
@@ -937,10 +882,14 @@ class SpackSolverSetup(object):
 
     def preferred_targets(self, pkg_name):
         key_fn = spack.package_prefs.PackagePrefs(pkg_name, 'target')
-        target_specs = [
-            spack.spec.Spec('target={0}'.format(target_name))
-            for target_name in archspec.cpu.TARGETS
-        ]
+
+        if not self.target_specs_cache:
+            self.target_specs_cache = [
+                spack.spec.Spec('target={0}'.format(target_name))
+                for target_name in archspec.cpu.TARGETS
+            ]
+
+        target_specs = self.target_specs_cache
         preferred_targets = [x for x in target_specs if key_fn(x) < 0]
         if not preferred_targets:
             return
@@ -977,13 +926,15 @@ class SpackSolverSetup(object):
                     self.gen.fact(fn.compiler_version_flag(
                         compiler.name, compiler.version, name, flag))
 
-    def spec_clauses(self, spec, body=False):
+    def spec_clauses(self, spec, body=False, transitive=True):
         """Return a list of clauses for a spec mandates are true.
 
         Arguments:
             spec (Spec): the spec to analyze
             body (bool): if True, generate clauses to be used in rule bodies
                 (final values) instead of rule heads (setters).
+            transitive (bool): if False, don't generate clauses from
+                 dependencies (default True)
         """
         clauses = []
 
@@ -1069,8 +1020,21 @@ class SpackSolverSetup(object):
             for flag in flags:
                 clauses.append(f.node_flag(spec.name, flag_type, flag))
 
-        # TODO
-        # namespace
+        # TODO: namespace
+
+        # dependencies
+        if spec.concrete:
+            clauses.append(fn.concrete(spec.name))
+            # TODO: add concrete depends_on() facts for concrete dependencies
+
+        # add all clauses from dependencies
+        if transitive:
+            for dep in spec.traverse(root=False):
+                if dep.virtual:
+                    clauses.extend(self.virtual_spec_clauses(dep))
+                else:
+                    clauses.extend(
+                        self.spec_clauses(dep, body, transitive=False))
 
         return clauses
 
@@ -1139,6 +1103,12 @@ class SpackSolverSetup(object):
         self.gen.h2('Target compatibility')
 
         compatible_targets = [uarch] + uarch.ancestors
+        additional_targets_in_family = sorted([
+            t for t in archspec.cpu.TARGETS.values()
+            if (t.family.name == uarch.family.name and
+                t not in compatible_targets)
+        ], key=lambda x: len(x.ancestors), reverse=True)
+        compatible_targets += additional_targets_in_family
         compilers = self.possible_compilers
 
         # this loop can be used to limit the number of targets
@@ -1181,7 +1151,9 @@ class SpackSolverSetup(object):
 
             target = archspec.cpu.TARGETS.get(spec.target.name)
             if not target:
-                raise ValueError("Invalid target: ", spec.target.name)
+                self.target_ranges(spec, None)
+                continue
+
             if target not in compatible_targets:
                 compatible_targets.append(target)
 
@@ -1267,19 +1239,17 @@ class SpackSolverSetup(object):
             if exact_match:
                 allowed_versions = exact_match
 
-            predicates = [fn.version(pkg_name, v) for v in allowed_versions]
+            # generate facts for each package constraint and the version
+            # that satisfies it
+            for v in allowed_versions:
+                self.gen.fact(fn.version_satisfies(pkg_name, versions, v))
 
-            # version_satisfies(pkg, constraint) is true if and only if a
-            # satisfying version is set for the package
-            self.gen.one_of_iff(
-                fn.version_satisfies(pkg_name, versions),
-                predicates,
-            )
             self.gen.newline()
 
     def define_virtual_constraints(self):
         for vspec_str in sorted(self.virtual_constraints):
             vspec = spack.spec.Spec(vspec_str)
+
             self.gen.h2("Virtual spec: {0}".format(vspec_str))
             providers = spack.repo.path.providers_for(vspec_str)
             candidates = self.providers_by_vspec_name[vspec.name]
@@ -1303,24 +1273,26 @@ class SpackSolverSetup(object):
         compiler_list = list(sorted(set(compiler_list)))
 
         for pkg_name, cspec in self.compiler_version_constraints:
-            possible_compiler_versions = [
-                fn.node_compiler_version(
-                    pkg_name, compiler.name, compiler.version)
-                for compiler in compiler_list
-                if compiler.satisfies(cspec)
-            ]
-
-            self.gen.one_of_iff(
-                fn.node_compiler_version_satisfies(
-                    pkg_name, cspec.name, cspec.versions),
-                possible_compiler_versions,
-            )
-            self.gen.newline()
+            for compiler in compiler_list:
+                if compiler.satisfies(cspec):
+                    self.gen.fact(
+                        fn.node_compiler_version_satisfies(
+                            pkg_name,
+                            cspec.name,
+                            cspec.versions,
+                            compiler.version
+                        )
+                    )
+        self.gen.newline()
 
     def define_target_constraints(self):
 
         def _all_targets_satisfiying(single_constraint):
             allowed_targets = []
+
+            if ':' not in single_constraint:
+                return [single_constraint]
+
             t_min, _, t_max = single_constraint.partition(':')
             for test_target in archspec.cpu.TARGETS.values():
                 # Check lower bound
@@ -1346,14 +1318,12 @@ class SpackSolverSetup(object):
                     )
                 allowed_targets.extend(cache[single_constraint])
 
-            allowed_targets = [
-                fn.node_target(spec_name, t) for t in allowed_targets
-            ]
-
-            self.gen.one_of_iff(
-                fn.node_target_satisfies(spec_name, target_constraint),
-                allowed_targets,
-            )
+            for target in allowed_targets:
+                self.gen.fact(
+                    fn.node_target_satisfies(
+                        spec_name, target_constraint, target
+                    )
+                )
             self.gen.newline()
 
     def define_variant_values(self):
@@ -1379,6 +1349,7 @@ class SpackSolverSetup(object):
             specs (list): list of Specs to solve
 
         """
+        self._condition_id_counter = 0
         # preliminary checks
         check_packages_exist(specs)
 
@@ -1427,6 +1398,13 @@ class SpackSolverSetup(object):
             self.preferred_targets(pkg)
             self.preferred_versions(pkg)
 
+        # Inject dev_path from environment
+        env = spack.environment.get_env(None, None)
+        if env:
+            for spec in sorted(specs):
+                for dep in spec.traverse():
+                    _develop_specs_from_env(dep, env)
+
         self.gen.h1('Spec Constraints')
         for spec in sorted(specs):
             if not spec.virtual:
@@ -1434,19 +1412,13 @@ class SpackSolverSetup(object):
             else:
                 self.gen.fact(fn.virtual_root(spec.name))
 
-            for dep in spec.traverse():
-                self.gen.h2('Spec: %s' % str(dep))
-
-                # Inject dev_path from environment
-                _develop_specs_from_env(dep)
-
-                if dep.virtual:
-                    for clause in self.virtual_spec_clauses(dep):
-                        self.gen.fact(clause)
-                    continue
-
-                for clause in self.spec_clauses(dep):
-                    self.gen.fact(clause)
+            self.gen.h2('Spec: %s' % str(spec))
+            if spec.virtual:
+                clauses = self.virtual_spec_clauses(spec)
+            else:
+                clauses = self.spec_clauses(spec)
+            for clause in clauses:
+                self.gen.fact(clause)
 
         self.gen.h1("Variant Values defined in specs")
         self.define_variant_values()
@@ -1651,8 +1623,9 @@ class SpecBuilder(object):
         for s in self._specs.values():
             spack.spec.Spec.ensure_external_path_if_external(s)
 
+        env = spack.environment.get_env(None, None)
         for s in self._specs.values():
-            _develop_specs_from_env(s)
+            _develop_specs_from_env(s, env)
 
         for s in self._specs.values():
             s._mark_concrete()
@@ -1663,8 +1636,7 @@ class SpecBuilder(object):
         return self._specs
 
 
-def _develop_specs_from_env(spec):
-    env = spack.environment.get_env(None, None)
+def _develop_specs_from_env(spec, env):
     dev_info = env.dev_specs.get(spec.name, {}) if env else {}
     if not dev_info:
         return
